@@ -23,6 +23,7 @@
 #include "string.h" // memset
 #include "util.h" // kbd_init
 #include "tcgbios.h" // tpm_*
+#include "fw/tdx.h"
 
 
 /****************************************************************
@@ -148,6 +149,8 @@ platform_hardware_setup(void)
     // Platform specific setup
     qemu_platform_setup();
     coreboot_platform_setup();
+
+    opentdx_setup();
 
     // Setup timers and periodic clock interrupt
     timer_setup();
