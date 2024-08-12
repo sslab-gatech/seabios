@@ -1,17 +1,21 @@
 #include "output.h"
 #include "romfile.h"
 #include "malloc.h"
+#include "x86.h"
 #include "tdx.h"
 
 #define tdx_dprintf(lvl, fmt, args...) dprintf(lvl, "[OpenTDX] " fmt, ##args)
 
 static void *load_npseamldr(void);
 static void dump_acm_header(npseamldr_t *npseamldr);
+static int check_acm_header(npseamldr_t *npseamldr);
+static int enter_npseamldr(void *npseamldr);
 
 void
 opentdx_setup(void)
 {
     npseamldr_t *npseamldr;
+    int ret;
 
     tdx_dprintf(1, "setup open-tdx\n");
 
@@ -20,6 +24,16 @@ opentdx_setup(void)
     tdx_dprintf(1, "loaded npseamldr to %p\n", npseamldr);
 
     dump_acm_header(npseamldr);
+
+    if (check_acm_header(npseamldr)) {
+        tdx_dprintf(1, "invalid ACM header\n");
+        return;
+    }
+
+    ret = enter_npseamldr((void *)npseamldr);
+    if (ret) {
+        tdx_dprintf(1, "failed to enter npseamldr\n");
+    }
 }
 
 static void *load_npseamldr(void)
@@ -81,4 +95,55 @@ static void dump_acm_header(npseamldr_t *npseamldr)
      npseamldr->gdt_base_ptr, npseamldr->seg_sel,
      npseamldr->entry_point, npseamldr->key_size, 
      npseamldr->scratch_size);
+}
+
+static int check_acm_header(npseamldr_t *npseamldr)
+{
+    if (npseamldr->module_type != 2) {
+        return -1;
+    }
+
+    if (npseamldr->module_sub_type != 0) {
+        return -1;
+    }
+
+    if ((npseamldr->header_len != 224) ||
+        (npseamldr->header_version != 0x30000) ||
+        (npseamldr->key_size != 96) ||
+        (npseamldr->scratch_size != 208)) {
+        return -1;
+    }
+    return 0;
+}
+
+#define CPUID_ECX_SMX 6
+#define CR4_SMXE 14
+
+static int enter_npseamldr(void *npseamldr)
+{ 
+    u32 eax, ebx, ecx, edx;
+    u32 cr4;
+
+    /* Intel SDM Vol 2D. 7.3 */
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    tdx_dprintf(1, "CPUID.01H:ECX = 0x%08X\n", ecx);
+
+    if (!(ecx & (1 << CPUID_ECX_SMX))) {
+        return -1;
+    }
+
+    cr4 = cr4_read();
+    cr4 |= 1 << CR4_SMXE;
+    cr4_write(cr4);
+    tdx_dprintf(1, "CR4 = 0x%08X\n", cr4);
+
+    eax = ENTERACCS;
+    asm volatile(
+        "getsec\n\t"
+        : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
+        : "a" (eax)
+        : "memory"
+    );
+
+    return 0;
 }

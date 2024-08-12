@@ -93,6 +93,15 @@ static inline u16 cr0_vm86_read(void) {
     return cr0;
 }
 
+static inline u32 cr4_read(void) {
+    u32 cr4;
+    asm("movl %%cr4, %0" : "=r"(cr4));
+    return cr4;
+}
+static inline void cr4_write(u32 cr4) {
+    asm("movl %0, %%cr4" : : "r"(cr4));
+}
+
 static inline u64 rdmsr(u32 index)
 {
     u64 ret;

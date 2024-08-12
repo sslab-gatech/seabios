@@ -3,6 +3,19 @@
 
 #include "types.h"
 
+/*
+Leaf value (in eax) calling GETSEC
+*/
+#define CAPABILITIES    0
+#define ENTERACCS       2
+#define EXITAC          3
+#define SENTER          4
+#define SEXIT           5
+#define PARAMETERS      6
+#define SMCTRL          7
+#define WAKEUP          8
+
+
 /* 
 Intel Trusted Execution Technology (Intel TXT) Software Development Guide
     A.1.1 ACM Header Format   
@@ -51,6 +64,6 @@ typedef struct {
 } npseamldr_t; 
 
 
-void opentdx_setup(void);
+__attribute__((used)) void opentdx_setup(void); // Force symbol remains
 
 #endif
