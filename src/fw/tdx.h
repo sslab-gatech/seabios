@@ -4,8 +4,8 @@
 #include "types.h"
 
 /*
-Leaf value (in eax) calling GETSEC
-*/
+ * Leaf value (in eax) calling GETSEC
+ */
 #define CAPABILITIES    0
 #define ENTERACCS       2
 #define EXITAC          3
@@ -15,11 +15,42 @@ Leaf value (in eax) calling GETSEC
 #define SMCTRL          7
 #define WAKEUP          8
 
+/*
+ * TDX MSRs
+ */
+#define MSR_IA32_SEAMRR_PHYS_BASE   0x1400
+#define MSR_IA32_SEAMRR_PHYS_MASK   0x1401
+
+#define SEAMRR_BLOCK_SIZE           0x2000000
+#define SEAMRR_CONFIGURE_OFFSET     3
+#define SEAMRR_LOCK_OFFSET          10
+#define SEAMRR_ENABLE_OFFSET        11
+
+typedef union {
+    struct {
+        u32 reserved0   : 3;
+        u8  configured  : 1;
+        u32 reserved1   : 21;
+        u64 base        : 39;
+    };
+    u64 raw;
+} seamrr_base_t;
+
+typedef union {
+    struct {
+        u16 reserved0   : 10;
+        u8  locked      : 1;
+        u8  enabled     : 1;
+        u16 reserved1   : 13;
+        u64 mask        : 39;
+    };
+    u64 raw;
+} seamrr_mask_t;
 
 /* 
-Intel Trusted Execution Technology (Intel TXT) Software Development Guide
-    A.1.1 ACM Header Format   
-*/
+ * Intel Trusted Execution Technology (Intel TXT) Software Development Guide
+ *    A.1.1 ACM Header Format
+ */
 typedef struct {
     // 00000000
     u16 module_type;

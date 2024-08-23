@@ -1,11 +1,13 @@
 #include "output.h"
 #include "romfile.h"
 #include "malloc.h"
+#include "e820map.h"
 #include "x86.h"
 #include "tdx.h"
 
 #define tdx_dprintf(lvl, fmt, args...) dprintf(lvl, "[OpenTDX] " fmt, ##args)
 
+static void *setup_seam_range(u32 size);
 static void *load_npseamldr(void);
 static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
@@ -15,9 +17,19 @@ void
 opentdx_setup(void)
 {
     npseamldr_t *npseamldr;
+    u32 seam_range_size = 64 * 1024 * 1024;
+    void *seam_range_base;
     int ret;
 
     tdx_dprintf(1, "setup open-tdx\n");
+
+    seam_range_base = setup_seam_range(seam_range_size);
+    if (!seam_range_base) {
+        return;
+    }
+
+    tdx_dprintf(1, "configured seam range [%p, %p)\n", seam_range_base, seam_range_base + seam_range_size);
+
 
     npseamldr = (npseamldr_t *) load_npseamldr();
     if (!npseamldr) {
@@ -40,6 +52,50 @@ opentdx_setup(void)
     }
 
     return;
+}
+
+static void *setup_seam_range(u32 size)
+{
+    seamrr_base_t seamrr_base;
+    seamrr_mask_t seamrr_mask;
+    u64 n, i, min_size;
+    u64 start = 0;
+
+    if (size % SEAMRR_BLOCK_SIZE) {
+        tdx_dprintf(1, "seam_range_size is not aligned to 32MB\n");
+        return NULL;
+    }
+
+    // Compute minimum size of memory space to allocate `size` of memory
+    // at `SEAMRR_BLOCK_SIZE` aligned address
+    n = size / SEAMRR_BLOCK_SIZE;
+    min_size = (n + 1) * SEAMRR_BLOCK_SIZE;
+
+    for (i = 0; i < e820_count; i++) {
+        struct e820entry *e = &e820_list[i];
+        if (e->type == E820_RESERVED)
+            continue;
+        if (e->size < min_size)
+            continue;
+
+        start = (e->start + (SEAMRR_BLOCK_SIZE - 1)) & ~(SEAMRR_BLOCK_SIZE - 1);
+        break;
+    }
+
+    if (!start) {
+        tdx_dprintf(1, "failed to malloc(seam_range_size)\n");
+        return NULL;
+    }
+
+    e820_add(start, size, E820_RESERVED);
+
+    seamrr_base.raw = start | (1 << SEAMRR_CONFIGURE_OFFSET);
+    seamrr_mask.raw = size | (1 << SEAMRR_ENABLE_OFFSET);
+
+    wrmsr(MSR_IA32_SEAMRR_PHYS_BASE, seamrr_base.raw);
+    wrmsr(MSR_IA32_SEAMRR_PHYS_MASK, seamrr_mask.raw);
+
+    return (void *) start;
 }
 
 static void *load_npseamldr(void)
