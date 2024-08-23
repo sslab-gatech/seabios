@@ -9,7 +9,7 @@
 static void *load_npseamldr(void);
 static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
-static int enter_npseamldr(void *npseamldr);
+static int enter_npseamldr(void *npseamldr, u32 npseamldr_size);
 
 void
 opentdx_setup(void)
@@ -20,6 +20,9 @@ opentdx_setup(void)
     tdx_dprintf(1, "setup open-tdx\n");
 
     npseamldr = (npseamldr_t *) load_npseamldr();
+    if (!npseamldr) {
+        return;
+    }
 
     tdx_dprintf(1, "loaded npseamldr to %p\n", npseamldr);
 
@@ -30,10 +33,13 @@ opentdx_setup(void)
         return;
     }
 
-    ret = enter_npseamldr((void *)npseamldr);
+    ret = enter_npseamldr((void *)npseamldr, npseamldr->size * 4);
     if (ret) {
         tdx_dprintf(1, "failed to enter npseamldr\n");
+        return;
     }
+
+    return;
 }
 
 static void *load_npseamldr(void)
@@ -118,11 +124,13 @@ static int check_acm_header(npseamldr_t *npseamldr)
 
 #define CPUID_ECX_SMX 6
 #define CR4_SMXE 14
+#define MSR_IA32_FEATURE_CONTROL 0x0000003a
 
-static int enter_npseamldr(void *npseamldr)
+static int enter_npseamldr(void *npseamldr, u32 npseamldr_size)
 { 
     u32 eax, ebx, ecx, edx;
     u32 cr4;
+    u32 feature_control;
 
     /* Intel SDM Vol 2D. 7.3 */
     cpuid(1, &eax, &ebx, &ecx, &edx);
@@ -137,11 +145,24 @@ static int enter_npseamldr(void *npseamldr)
     cr4_write(cr4);
     tdx_dprintf(1, "CR4 = 0x%08X\n", cr4);
 
+    feature_control = rdmsr(MSR_IA32_FEATURE_CONTROL);
+    tdx_dprintf(1, "IA32_FEATURE_CONTROL = 0x%08X\n", feature_control);
+
+    eax = CAPABILITIES;
+    ebx = 0;
+    asm volatile(
+        "getsec\n\t"
+        : "=a" (eax)
+        : "a" (eax), "b" (ebx)
+        : "memory"
+    );
+    tdx_dprintf(1, "GETSEC[CAPABILITIES] = 0x%08X\n", eax);
+
     eax = ENTERACCS;
     asm volatile(
         "getsec\n\t"
-        : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
-        : "a" (eax)
+        : "=a" (eax)
+        : "a" (eax), "b" (npseamldr), "c" (npseamldr_size)
         : "memory"
     );
 
