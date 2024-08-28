@@ -253,6 +253,7 @@ static inline u8 readb(const void *addr) {
 #define GDT_DATA     (0x93ULL << 40) // Data segment - W,A bits also set
 #define GDT_B        (0x1ULL << 54)  // Big flag
 #define GDT_G        (0x1ULL << 55)  // Granularity flag
+#define GDT_L        (0x1ULL << 53)  // Long mode
 // GDT bits for segment base
 #define GDT_BASE(v)  ((((u64)(v) & 0xff000000) << 32)           \
                       | (((u64)(v) & 0x00ffffff) << 16))
@@ -265,6 +266,12 @@ static inline u8 readb(const void *addr) {
 struct descloc_s {
     u16 length;
     u32 addr;
+} PACKED;
+
+struct descloc_s_64 {
+    u16 length;
+    u32 addr_low;
+    u32 addr_high;
 } PACKED;
 
 static inline void sgdt(struct descloc_s *desc) {

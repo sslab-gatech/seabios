@@ -4,6 +4,15 @@
 #include "types.h"
 
 /*
+ * For entering Long Mode
+ */
+#define MSR_EFER        0xC0000080
+
+#define PTES_PER_TABLE 512
+#define PTE(addr) ((addr & ~0xFFF) | 0x3) // RW | P
+#define HPTE(addr) ((addr & ~0x3FFFFFFF) | 0x83) // PS | RW | P
+
+/*
  * Leaf value (in eax) calling GETSEC
  */
 #define CAPABILITIES    0

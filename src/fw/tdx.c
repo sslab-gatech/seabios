@@ -13,6 +13,73 @@ static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
 static int enter_npseamldr(void *npseamldr, u32 npseamldr_size);
 
+u64 pml4[PTES_PER_TABLE] VARFSEG __aligned(4096);
+u64 pdptr[PTES_PER_TABLE] VARFSEG __aligned(4096) = { 
+    HPTE(0x0), HPTE(0x40000000), HPTE(0x80000000), HPTE(0xC0000000), 0,
+    };
+
+u64 rombios64_gdt[] VARFSEG __aligned(8) = {
+    // First entry can't be used.
+    0x0000000000000000LL,
+    // 64 bit long mode code segment
+    GDT_GRANLIMIT(0xffffffff) | GDT_CODE | GDT_L,
+    // 64 bit long mode data segment
+    GDT_GRANLIMIT(0xffffffff) | GDT_DATA | GDT_B,
+};
+
+struct descloc_s_64 rombios64_gdt_80 VARFSEG = {
+    .length = sizeof(rombios64_gdt) - 1,
+    .addr_low = (u32)rombios64_gdt,
+    .addr_high = (u32) 0,
+};
+
+static inline void enter_longmode()
+{
+    asm volatile(
+        "movl %%cr4, %%eax\n\t"
+        "btsl $5, %%eax\n\t" // Enable Page Address Extension (PAE)
+        "movl %%eax, %%cr4\n\t"
+        "movl %1, %%cr3\n\t" // Set page table base address
+        "movl %[efer], %%ecx\n\t"
+        "rdmsr\n\t"
+        "btsl $8, %%eax\n\t" // Enable long mode in EFER
+        "wrmsr\n\t"
+        "movl %%cr0, %%eax\n\t"
+        "btsl $31, %%eax\n\t" // Enable paging in CR0
+        "movl %%eax, %%cr0\n\t"
+        "lgdt (%%ebx)\n\t"
+        "ljmpl $0x8, $1f\n\t"
+        "1:\n\t"
+        :
+        : "b" (&rombios64_gdt_80), "r" (pml4), [efer] "g" (MSR_EFER)
+        : "eax", "ecx", "memory"
+    );
+}
+
+
+static inline void enteraccs(void *npseamldr, u32 npseamldr_size)
+{
+    asm volatile(
+        "mov %[gdt], %%eax\n\t"
+        ".byte 0x49, 0x89, 0xc1\n\t" // mov rax, r9
+        ".byte 0x48, 0x8d, 0x05, 0x1c, 0x00, 0x00, 0x00\n\t" // lea [rip + 0x1c], rax
+        ".byte 0x49, 0x89, 0xc2\n\t" // mov rax, r10
+        "mov %%cr3, %%eax\n\t"
+        ".byte 0x49, 0x89, 0xc3\n\t" // mov rax, r11
+        "mov %[idt], %%eax\n\t"
+        ".byte 0x49, 0x89, 0xc4\n\t" // mov rax, r12
+        "mov %[enteraccs], %%eax\n\t"
+        "mov %[npseamldr], %%ebx\n\t"
+        "mov %[npseamldr_size], %%ecx\n\t"
+        "getsec\n\t"
+        "end:\n\t"
+        :
+        :   [gdt] "g" (&rombios64_gdt_80), [idt] "g" (0),
+            [enteraccs] "g" (ENTERACCS), [npseamldr] "r" (npseamldr), [npseamldr_size] "r" (npseamldr_size)
+        : "%eax", "%ebx", "%ecx"
+    );
+}
+
 void
 opentdx_setup(void)
 {
@@ -44,6 +111,9 @@ opentdx_setup(void)
         tdx_dprintf(1, "invalid ACM header\n");
         return;
     }
+
+    // Setup huge page table
+    pml4[0] = PTE((u64) pdptr);
 
     ret = enter_npseamldr((void *)npseamldr, npseamldr->size * 4);
     if (ret) {
@@ -214,13 +284,7 @@ static int enter_npseamldr(void *npseamldr, u32 npseamldr_size)
     );
     tdx_dprintf(1, "GETSEC[CAPABILITIES] = 0x%08X\n", eax);
 
-    eax = ENTERACCS;
-    asm volatile(
-        "getsec\n\t"
-        : "=a" (eax)
-        : "a" (eax), "b" (npseamldr), "c" (npseamldr_size)
-        : "memory"
-    );
-
+    enter_longmode();
+    enteraccs(npseamldr, npseamldr_size);
     return 0;
 }
