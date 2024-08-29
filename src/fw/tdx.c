@@ -18,13 +18,15 @@ u64 pdptr[PTES_PER_TABLE] VARFSEG __aligned(4096) = {
     HPTE(0x0), HPTE(0x40000000), HPTE(0x80000000), HPTE(0xC0000000), 0,
     };
 
+extern struct descloc_s rombios32_gdt_48;
+
 u64 rombios64_gdt[] VARFSEG __aligned(8) = {
     // First entry can't be used.
     0x0000000000000000LL,
-    // 64 bit long mode code segment
+    // 64 bit code segment for long mode
     GDT_GRANLIMIT(0xffffffff) | GDT_CODE | GDT_L,
-    // 64 bit long mode data segment
-    GDT_GRANLIMIT(0xffffffff) | GDT_DATA | GDT_B,
+    // 64 bit code segment for protected mode
+    GDT_GRANLIMIT(0xffffffff) | GDT_CODE | GDT_B,
 };
 
 struct descloc_s_64 rombios64_gdt_80 VARFSEG = {
@@ -33,12 +35,16 @@ struct descloc_s_64 rombios64_gdt_80 VARFSEG = {
     .addr_high = (u32) 0,
 };
 
+static u64 rsp;
+
 static inline void enter_longmode()
 {
+    tdx_dprintf(1, "entering long mode\n");
+
     asm volatile(
         "movl %%cr4, %%eax\n\t"
-        "btsl $5, %%eax\n\t" // Enable Page Address Extension (PAE)
-        "movl %%eax, %%cr4\n\t"
+        "btsl $5, %%eax\n\t"
+        "movl %%eax, %%cr4\n\t" // Enable Page Address Extension (PAE) in CR4
         "movl %1, %%cr3\n\t" // Set page table base address
         "movl %[efer], %%ecx\n\t"
         "rdmsr\n\t"
@@ -56,28 +62,96 @@ static inline void enter_longmode()
     );
 }
 
-
-static inline void enteraccs(void *npseamldr, u32 npseamldr_size)
+static inline void exit_longmode()
 {
     asm volatile(
-        "mov %[gdt], %%eax\n\t"
+        "movl %%esp, %%ebx\n\t"
+        "andl $0x7, %%ebx\n\t"
+        "subl %%ebx, %%esp\n\t" // Align stack address to 8 bytes
+        ".byte 0x6a, 0x10\n\t" // push 0x10
+        ".byte 0x48, 0x8d, 0x05, 0x05, 0x00, 0x00, 0x00\n\t" // lea [rip + 0x5], rax
+        "pushl %%eax\n\t" // push rax
+        ".byte 0x48, 0xff, 0x2c, 0x24\n\t" // ljmp *rsp
+        "1:\n\t" // From here, we are in X86 mode
+        "movl %%cr0, %%eax\n\t"
+        "btrl $31, %%eax\n\t"
+        "movl %%eax, %%cr0\n\t" // Disable paging in CR0
+        "movl %[efer], %%ecx\n\t"
+        "rdmsr\n\t"
+        "btrl $8, %%eax\n\t"
+        "wrmsr\n\t" // Disable long mode in EFER
+        "movl %[cr3], %%cr3\n\t" // Unset page table base address
+        "movl %%cr4, %%eax\n\t"
+        "btrl $5, %%eax\n\t"
+        "movl %%eax, %%cr4\n\t" // Disable PAE in CR4
+        "add %%ebx, %%esp\n\t" // Restore 4-byte aligned stack address
+        "lgdtl %[gdt32]\n\t"
+        "ljmpl $0x8, $2f\n\t"
+        "2:\n\t"
+        :
+        : "b" (&rombios64_gdt_80), [cr3] "r" (0), [efer] "g" (MSR_EFER), [gdt32] "m" (rombios32_gdt_48)
+        : "eax", "esp", "ecx", "memory"
+    );
+
+    tdx_dprintf(1, "exited from long mode\n");
+}
+
+
+static inline u32 enteraccs(void *npseamldr, u32 npseamldr_size)
+{
+    u32 ret;
+
+    // Store registers
+    asm volatile(
+        "movl %%esp, %%ebx\n\t"
+        "andl $0x7, %%ebx\n\t"
+        "subl %%ebx, %%esp\n\t" // Align esp to 8-bytes and save remainder to ebx
+        "pushl %%ecx\n\t"
+        "pushl %%edx\n\t"
+        "pushl %%ebx\n\t"
+        "pushl %%ebp\n\t"
+        "pushl %%esi\n\t"
+        "pushl %%edi\n\t"
+        ".byte 0x48, 0x89, 0x20\n\t"  // mov rsp, (rax)
+        :
+        : "a" ((u32) &rsp)
+        : "ebx", "esp", "memory"
+    );
+
+    asm volatile(
         ".byte 0x49, 0x89, 0xc1\n\t" // mov rax, r9
-        ".byte 0x48, 0x8d, 0x05, 0x1c, 0x00, 0x00, 0x00\n\t" // lea [rip + 0x1c], rax
+        ".byte 0x48, 0x8d, 0x05, 0x18, 0x00, 0x00, 0x00\n\t" // lea [rip + 0x18], rax
         ".byte 0x49, 0x89, 0xc2\n\t" // mov rax, r10
         "mov %%cr3, %%eax\n\t"
         ".byte 0x49, 0x89, 0xc3\n\t" // mov rax, r11
         "mov %[idt], %%eax\n\t"
         ".byte 0x49, 0x89, 0xc4\n\t" // mov rax, r12
         "mov %[enteraccs], %%eax\n\t"
-        "mov %[npseamldr], %%ebx\n\t"
-        "mov %[npseamldr_size], %%ecx\n\t"
         "getsec\n\t"
         "end:\n\t"
+        ".byte 0x4c, 0x89, 0xc8\n\t" // mov r9, rax
+        : "=a" (ret)
+        :   "a" (&rombios64_gdt), [idt] "g" (0),
+            [enteraccs] "g" (ENTERACCS), "b" (npseamldr), "c" (npseamldr_size)
         :
-        :   [gdt] "g" (&rombios64_gdt_80), [idt] "g" (0),
-            [enteraccs] "g" (ENTERACCS), [npseamldr] "r" (npseamldr), [npseamldr_size] "r" (npseamldr_size)
-        : "%eax", "%ebx", "%ecx"
     );
+
+    // Restore registers
+    asm volatile(
+        ".byte 0x48, 0x8b, 0x23\n\t" // mov (rbx), rsp
+        "popl %%edi\n\t"
+        "popl %%esi\n\t"
+        "popl %%ebp\n\t"
+        "popl %%ebx\n\t"
+        "popl %%edx\n\t"
+        "popl %%ecx\n\t"
+        "addl %%ebx, %%esp\n\t" // Restore original 4-byte aligned stack
+        :
+        : "b" ((u32) &rsp)
+        : "esp"
+    );
+
+    return ret;
 }
 
 void
@@ -117,9 +191,11 @@ opentdx_setup(void)
 
     ret = enter_npseamldr((void *)npseamldr, npseamldr->size * 4);
     if (ret) {
-        tdx_dprintf(1, "failed to enter npseamldr\n");
+        tdx_dprintf(1, "failed to enter npseamldr (exit code: %d)\n", ret);
         return;
     }
+
+    tdx_dprintf(1, "npseamldr exited with %d\n", ret);
 
     return;
 }
@@ -257,6 +333,7 @@ static int enter_npseamldr(void *npseamldr, u32 npseamldr_size)
     u32 eax, ebx, ecx, edx;
     u32 cr4;
     u32 feature_control;
+    int ret;
 
     /* Intel SDM Vol 2D. 7.3 */
     cpuid(1, &eax, &ebx, &ecx, &edx);
@@ -284,7 +361,11 @@ static int enter_npseamldr(void *npseamldr, u32 npseamldr_size)
     );
     tdx_dprintf(1, "GETSEC[CAPABILITIES] = 0x%08X\n", eax);
 
+    tdx_dprintf(1, "execute GETSEC[ENTERACCS]\n");
+
     enter_longmode();
-    enteraccs(npseamldr, npseamldr_size);
-    return 0;
+    ret = (int) enteraccs(npseamldr, npseamldr_size);
+    exit_longmode();
+
+    return ret;
 }
