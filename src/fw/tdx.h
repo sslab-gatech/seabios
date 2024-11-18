@@ -36,8 +36,16 @@
 #define SEAMRR_ENABLE_OFFSET        11
 
 /* SEAMCALL Leafs */
-#define SEAMLDR_INFO                0
-#define SEAMLDR_INSTALL             1
+#define SEAMLDR_INFO                0x0
+#define SEAMLDR_INSTALL             0x1
+
+/* SEAMLDR PARAMS */
+#define SEAMLDR_PARAMS_MAX_MODULE_PAGES 496
+#define SIGSTRUCT_MODULUS_SIZE          384
+#define SIGSTRUCT_SIGNATURE_SIZE        384
+#define SIGSTRUCT_SEAMHASH_SIZE         48
+
+#define SEAM_SIGSTRUCT_MAX_CPUID_TABLE_SIZE 255
 
 typedef union {
     struct {
@@ -136,6 +144,82 @@ typedef struct {
     seamextend_t seamextend;
     u8 reserved1[88];
 } seamldr_info_t;
+
+typedef union
+{
+    struct
+    {
+        u32 reserved        : 31;
+        u32 is_debug_signed :1;
+    };
+
+    u32 raw;
+} module_type_t;
+
+typedef union
+{
+    struct
+    {
+        u8 seam_minor_svn;
+        u8 seam_major_svn;
+    };
+
+    u16 raw;
+} seam_svn_t;
+
+typedef struct {
+    u32 header_type;
+    u32 header_length;
+    u32 header_version;
+    module_type_t module_type;
+    u32 module_vendor;
+    u32 date;
+    u32 size;
+    u32 key_size;
+    u32 modulus_size;
+    u32 exponent_size;
+    u8 reserved0[88];
+
+    u8 modulus[SIGSTRUCT_MODULUS_SIZE];
+    u32 exponent;
+    u8 signature[SIGSTRUCT_SIGNATURE_SIZE];
+
+    u8 seamhash[SIGSTRUCT_SEAMHASH_SIZE];
+    seam_svn_t seamsvn;
+    u64 attributes;
+    u32 rip_offset;
+    u8 num_stack_pages;
+    u8 num_tls_pages;
+    u16 num_keyhole_pages;
+    u16 num_global_data_pages;
+    u16 max_tdmrs;
+    u16 max_rsvd_per_tdmr;
+    u16 pamt_entry_size_4k;
+    u16 pamt_entry_size_2m;
+    u16 pamt_entry_size_1g;
+    u8 reserved1[6];
+    u16 module_hv;
+    u16 min_update_hv;
+    u8 no_downgrade;
+    u8 reserved2[1];
+    u16 num_handoff_pages;
+
+    u32 gdt_idt_offset;
+    u32 fault_wrapper_offset;
+    u8 reserved3[24];
+
+    u32 cpuid_table_size;
+    u32 cpuid_table[SEAM_SIGSTRUCT_MAX_CPUID_TABLE_SIZE];
+} seam_sigstruct_t;
+
+typedef struct {
+    u32 version;
+    u32 scenario;
+    u64 sigstruct_pa;
+    u8 reserved[104];
+    u64 num_module_pages;
+    u64 mod_pages_pa_list[SEAMLDR_PARAMS_MAX_MODULE_PAGES];
+} seamldr_params_t;
 
 
 __attribute__((used)) void opentdx_setup(void); // Force symbol remains

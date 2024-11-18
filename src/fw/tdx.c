@@ -227,7 +227,7 @@ static __attribute__((always_inline)) void __seamcall(u32 ebx, u32 ecx)
         "je 1f\n\t"
         ".byte 0x48, 0x83, 0xc8, 0xff\n\t" // or -1, rax
         "jmp 2f\n\t"
-        "1: .byte 0x48, 0x0f, 0xba, 0xe8, 0x01\n\t" // bts 1, rax
+        "1: .byte 0x48, 0x83, 0xc8, 0x01\n\t" // or 0x1, rax
         "2: .byte 0x66, 0x0f, 0x01, 0xcf\n\t" // seamcall
         ".byte 0x48, 0x89, 0x02\n\t" // mov rax, (rdx)
         : 
