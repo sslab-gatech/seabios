@@ -3,6 +3,8 @@
 #include "malloc.h"
 #include "e820map.h"
 #include "x86.h"
+#include "stacks.h"
+#include "paravirt.h"
 #include "tdx.h"
 
 #define MSR_IA32_VMX_BASIC          0x480
@@ -10,6 +12,9 @@
 #define CR4_SMXE 14
 #define CR4_VMXE 13
 #define MSR_IA32_FEATURE_CONTROL 0x0000003a
+
+#define APIC_ICR_LOW ((u8*)BUILD_APIC_ADDR + 0x300)
+#define MSR_LOCAL_APIC_ID 0x802
 
 #define tdx_dprintf(lvl, fmt, args...) dprintf(lvl, "[OpenTDX] " fmt, ##args)
 
@@ -19,6 +24,7 @@ static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
 static int enter_npseamldr(void *npseamldr, u32 npseamldr_size);
 static u64 dump_seamldr_info();
+static u64 install_tdx_module();
 
 u64 pml4[PTES_PER_TABLE] VARFSEG __aligned(4096);
 u64 pdptr[PTES_PER_TABLE] VARFSEG __aligned(4096) = { 
@@ -46,6 +52,10 @@ static u64 enteraccs_stack;
 static u64 seamcall_ret;
 
 static void *vmx_area;
+
+u32 TDXInstallLock __VISIBLE;
+u32 TDXInstallStack __VISIBLE;
+static u32 InstalledCPUs;
 
 static __attribute__((always_inline)) void __enter_longmode()
 {
@@ -294,6 +304,8 @@ opentdx_setup(void)
         return;
     }
 
+    install_tdx_module();
+
     free(vmx_area);
     return;
 }
@@ -502,5 +514,59 @@ static u64 dump_seamldr_info()
      seamldr_info->seamextend.p_seamldr_ready);
 
     free(buf);
+    return 0;
+}
+
+void VISIBLE32FLAT
+handle_tdx_install(void)
+{
+    u32 eax, ebx, ecx, cpuid_features;
+    cpuid(1, &eax, &ebx, &ecx, &cpuid_features);
+    tdx_dprintf(1, "CPU #%d: installing tdx module...\n", ebx >> 24);
+
+    // TDX module installation goes here
+
+    InstalledCPUs++;
+}
+
+static u64 install_tdx_module()
+{
+    u32 eax, ebx, ecx, cpuid_features;
+    cpuid(1, &eax, &ebx, &ecx, &cpuid_features);
+
+    tdx_dprintf(1, "CPU #%d: installing tdx module...\n", ebx >> 24);
+
+    // TDX module installation goes here
+
+    InstalledCPUs = 1;
+    u16 nCPUs = qemu_get_present_cpus_count();
+
+    // Setup jump trampoline to counter code.
+    u64 old = *(u64*)BUILD_AP_BOOT_ADDR;
+    extern void entry_tdx_install(void);
+    u64 new = (0xea | ((u64)SEG_BIOS<<24)
+               | (((u32)entry_tdx_install - BUILD_BIOS_ADDR) << 8));
+    *(u64*)BUILD_AP_BOOT_ADDR = new;
+
+    writel(&TDXInstallLock, 1);
+
+    barrier();
+    writel(APIC_ICR_LOW, 0x000C4500);
+    u32 sipi_vector = BUILD_AP_BOOT_ADDR >> 12;
+    writel(APIC_ICR_LOW, 0x000C4600 | sipi_vector);
+
+    while (InstalledCPUs != nCPUs)
+        asm volatile(
+        "  movl %%esp, %1\n"
+        "  movl $0, %0\n"
+        "1:rep ; nop\n"
+        "  lock btsl $0, %0\n"
+        "  jc 1b\n"
+        : "+m"(TDXInstallLock), "+m"(TDXInstallStack)
+        : : "cc", "memory");
+    yield();
+
+    *(u64*)BUILD_AP_BOOT_ADDR = old;
+
     return 0;
 }

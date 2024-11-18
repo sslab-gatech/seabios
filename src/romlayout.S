@@ -221,6 +221,28 @@ entry_smp:
         jmp 3b
         .code16
 
+// Entry point for installing TDX module through SIPI.
+        DECLFUNC entry_tdx_install
+entry_tdx_install:
+        // Transition to 32bit mode.
+        cli
+        cld
+        movl $2f + BUILD_BIOS_ADDR, %edx
+        jmp transition32_nmi_off
+        .code32
+        // Acquire lock and take ownership of shared stack
+1:      rep ; nop
+2:      lock btsl $0, TDXInstallLock
+        jc 1b
+        movl TDXInstallStack, %esp
+        // Call handle_tdx_install
+        calll _cfunc32flat_handle_tdx_install - BUILD_BIOS_ADDR
+        // Release lock and halt processor.
+        movl $0, TDXInstallLock
+3:      hlt
+        jmp 3b
+        .code16
+
 // Resume (and reboot) entry point - called from entry_post
         DECLFUNC entry_resume
 entry_resume:
