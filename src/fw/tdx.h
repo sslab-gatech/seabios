@@ -35,6 +35,10 @@
 #define SEAMRR_LOCK_OFFSET          10
 #define SEAMRR_ENABLE_OFFSET        11
 
+/* SEAMCALL Leafs */
+#define SEAMLDR_INFO                0
+#define SEAMLDR_INSTALL             1
+
 typedef union {
     struct {
         u32 reserved0   : 3;
@@ -102,6 +106,36 @@ typedef struct {
     // 000006c0
     u8 user_area[]; // modulo-64 byte increment
 } npseamldr_t; 
+
+typedef struct __attribute__((__packed__))
+{
+    u64 valid;
+    u16 current_seam_svn;
+    u8 last_patch_se_svn;
+    u8 reserved0[13];
+    u8 mrseam[48];
+    u8 mrsigner[48];
+    u64 attributes;
+    u8 seam_ready;
+    u8 system_under_debug;
+    u8 p_seamldr_ready;
+    u8 reserved1[5];
+} seamextend_t;
+
+typedef struct {
+    u32 version;
+    u32 attributes;
+    u32 vendor_id;
+    u32 build_date;
+    u16 build_num;
+    u16 minor;
+    u16 major;
+    u16 reserved0;
+    u32 acm_x2apic;
+    u32 num_remaining_updates;
+    seamextend_t seamextend;
+    u8 reserved1[88];
+} seamldr_info_t;
 
 
 __attribute__((used)) void opentdx_setup(void); // Force symbol remains

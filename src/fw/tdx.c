@@ -5,6 +5,12 @@
 #include "x86.h"
 #include "tdx.h"
 
+#define MSR_IA32_VMX_BASIC          0x480
+#define CPUID_ECX_SMX 6
+#define CR4_SMXE 14
+#define CR4_VMXE 13
+#define MSR_IA32_FEATURE_CONTROL 0x0000003a
+
 #define tdx_dprintf(lvl, fmt, args...) dprintf(lvl, "[OpenTDX] " fmt, ##args)
 
 static void *setup_seam_range(u32 size);
@@ -12,6 +18,7 @@ static void *load_npseamldr(void);
 static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
 static int enter_npseamldr(void *npseamldr, u32 npseamldr_size);
+static u64 dump_seamldr_info();
 
 u64 pml4[PTES_PER_TABLE] VARFSEG __aligned(4096);
 u64 pdptr[PTES_PER_TABLE] VARFSEG __aligned(4096) = { 
@@ -35,9 +42,12 @@ struct descloc_s_64 rombios64_gdt_80 VARFSEG = {
     .addr_high = (u32) 0,
 };
 
-static u64 rsp;
+static u64 enteraccs_stack;
+static u64 seamcall_ret;
 
-static inline void enter_longmode()
+static void *vmx_area;
+
+static __attribute__((always_inline)) void __enter_longmode()
 {
     tdx_dprintf(1, "entering long mode\n");
 
@@ -45,7 +55,7 @@ static inline void enter_longmode()
         "movl %%cr4, %%eax\n\t"
         "btsl $5, %%eax\n\t"
         "movl %%eax, %%cr4\n\t" // Enable Page Address Extension (PAE) in CR4
-        "movl %1, %%cr3\n\t" // Set page table base address
+        "movl %%ecx, %%cr3\n\t" // Set page table base address
         "movl %[efer], %%ecx\n\t"
         "rdmsr\n\t"
         "btsl $8, %%eax\n\t" // Enable long mode in EFER
@@ -57,12 +67,12 @@ static inline void enter_longmode()
         "ljmpl $0x8, $1f\n\t"
         "1:\n\t"
         :
-        : "b" (&rombios64_gdt_80), "r" (pml4), [efer] "g" (MSR_EFER)
-        : "eax", "ecx", "memory"
+        : "b" (&rombios64_gdt_80), "c" (pml4), [efer] "g" (MSR_EFER)
+        : "eax", "memory"
     );
 }
 
-static inline void exit_longmode()
+static __attribute__((always_inline)) void __exit_longmode()
 {
     asm volatile(
         "movl %%esp, %%ebx\n\t"
@@ -97,7 +107,37 @@ static inline void exit_longmode()
 }
 
 
-static inline u32 enteraccs(void *npseamldr, u32 npseamldr_size)
+static __attribute__((always_inline)) void __vmxon()
+{
+    asm volatile(
+        "mov %%cr4, %%eax\n\t"
+        "btsl %[cr4_vmxe], %%eax\n\t"
+        "mov %%eax, %%cr4\n\t"
+        "rdmsr\n\t"
+        "movl %%eax, (%%ebx)\n\t" // Save revision_id
+        "pushl %%ebx\n\t"
+        "vmxon (%%esp)\n\t"
+        "popl %%ebx\n\t"
+        :
+        : "b" (vmx_area), "c" (MSR_IA32_VMX_BASIC), [cr4_vmxe] "g" (CR4_VMXE)
+        : "eax", "memory"
+    );
+}
+
+static __attribute__((always_inline)) void __vmxoff()
+{
+    asm volatile(
+        "vmxoff\n\t"
+        "mov %%cr4, %%eax\n\t"
+        "btrl %[cr4_vmxe], %%eax\n\t"
+        "mov %%eax, %%cr4\n\t"
+        :
+        : [cr4_vmxe] "g" (CR4_VMXE)
+        : "eax"
+    );
+}
+
+static __attribute__((always_inline)) u32 __enteraccs(void *npseamldr, u32 npseamldr_size)
 {
     u32 ret;
 
@@ -114,7 +154,7 @@ static inline u32 enteraccs(void *npseamldr, u32 npseamldr_size)
         "pushl %%edi\n\t"
         ".byte 0x48, 0x89, 0x20\n\t"  // mov rsp, (rax)
         :
-        : "a" ((u32) &rsp)
+        : "a" ((u32) &enteraccs_stack)
         : "ebx", "esp", "memory"
     );
 
@@ -130,7 +170,7 @@ static inline u32 enteraccs(void *npseamldr, u32 npseamldr_size)
         "getsec\n\t"
         "end:\n\t"
         ".byte 0x4c, 0x89, 0xc8\n\t" // mov r9, rax
-        : "=a" (ret)
+        :
         :   "a" (&rombios64_gdt), [idt] "g" (0),
             [enteraccs] "g" (ENTERACCS), "b" (npseamldr), "c" (npseamldr_size)
         :
@@ -138,6 +178,7 @@ static inline u32 enteraccs(void *npseamldr, u32 npseamldr_size)
 
     // Restore registers
     asm volatile(
+        "mov %[rsp], %%ebx\n\t"
         ".byte 0x48, 0x8b, 0x23\n\t" // mov (rbx), rsp
         "popl %%edi\n\t"
         "popl %%esi\n\t"
@@ -146,12 +187,57 @@ static inline u32 enteraccs(void *npseamldr, u32 npseamldr_size)
         "popl %%edx\n\t"
         "popl %%ecx\n\t"
         "addl %%ebx, %%esp\n\t" // Restore original 4-byte aligned stack
-        :
-        : "b" ((u32) &rsp)
+        : "=a" (ret)
+        : [rsp] "g" ((u32) &enteraccs_stack)
         : "esp"
     );
 
     return ret;
+}
+
+static int enteraccs(void *npseamldr, u32 npseamldr_size)
+{
+    int ret;
+
+    __enter_longmode();
+    ret = (int) __enteraccs(npseamldr, npseamldr_size);
+    __exit_longmode();
+
+    return ret;
+}
+
+static __attribute__((always_inline)) void __seamcall(u32 ebx, u32 ecx)
+{
+    asm volatile(
+        "xor %%eax, %%eax\n\t"
+        ".byte 0x48, 0x0f, 0xba, 0xe8, 0x3f\n\t" // bts 63, rax
+        "cmp %[seamldr_info], %%ebx\n\t"
+        "je 2f\n\t"
+        "cmp %[seamldr_install], %%ebx\n\t"
+        "je 1f\n\t"
+        ".byte 0x48, 0x83, 0xc8, 0xff\n\t" // or -1, rax
+        "jmp 2f\n\t"
+        "1: .byte 0x48, 0x0f, 0xba, 0xe8, 0x01\n\t" // bts 1, rax
+        "2: .byte 0x66, 0x0f, 0x01, 0xcf\n\t" // seamcall
+        ".byte 0x48, 0x89, 0x02\n\t" // mov rax, (rdx)
+        : 
+        : "b" (ebx), "c" (ecx), [ret] "d" ((u32) &seamcall_ret),
+          [seamldr_info] "i" (SEAMLDR_INFO), [seamldr_install] "i" (SEAMLDR_INSTALL)
+        : "eax"
+    );
+}
+
+static u64 seamcall(u32 leaf, u32 ecx)
+{
+    __enter_longmode();
+    __vmxon();
+
+    __seamcall(0, ecx);
+
+    __vmxoff();
+    __exit_longmode();
+
+    return seamcall_ret;
 }
 
 void
@@ -160,7 +246,7 @@ opentdx_setup(void)
     npseamldr_t *npseamldr;
     u32 seam_range_size = 64 * 1024 * 1024;
     void *seam_range_base;
-    int ret;
+    u64 ret;
 
     tdx_dprintf(1, "setup open-tdx\n");
 
@@ -170,7 +256,6 @@ opentdx_setup(void)
     }
 
     tdx_dprintf(1, "configured seam range [%p, %p)\n", seam_range_base, seam_range_base + seam_range_size);
-
 
     npseamldr = (npseamldr_t *) load_npseamldr();
     if (!npseamldr) {
@@ -183,6 +268,7 @@ opentdx_setup(void)
 
     if (check_acm_header(npseamldr)) {
         tdx_dprintf(1, "invalid ACM header\n");
+        free(npseamldr);
         return;
     }
 
@@ -191,12 +277,24 @@ opentdx_setup(void)
 
     ret = enter_npseamldr((void *)npseamldr, npseamldr->size * 4);
     if (ret) {
-        tdx_dprintf(1, "failed to enter npseamldr (exit code: %d)\n", ret);
+        tdx_dprintf(1, "failed to enter npseamldr (exit code: %d)\n", (int) ret);
+        free(npseamldr);
         return;
     }
 
-    tdx_dprintf(1, "npseamldr exited with %d\n", ret);
+    tdx_dprintf(1, "npseamldr exited with %d\n", (int) ret);
+    free(npseamldr);
 
+    vmx_area = memalign_tmphigh(0x1000, 0x1000);
+
+    tdx_dprintf(1, "dump pseamldr info...\n");
+    ret = dump_seamldr_info();
+    if (ret) {
+        tdx_dprintf(1, "seamldr_info failed with 0x%llx\n", ret);
+        return;
+    }
+
+    free(vmx_area);
     return;
 }
 
@@ -264,6 +362,7 @@ static void *load_npseamldr(void)
     int ret = file->copy(file, dst, file->size);
     if (ret < 0) {
         tdx_dprintf(1, "failed to copy npseamldr\n");
+        free(dst);
         return NULL;
     }
 
@@ -324,16 +423,22 @@ static int check_acm_header(npseamldr_t *npseamldr)
     return 0;
 }
 
-#define CPUID_ECX_SMX 6
-#define CR4_SMXE 14
-#define MSR_IA32_FEATURE_CONTROL 0x0000003a
-
 static int enter_npseamldr(void *npseamldr, u32 npseamldr_size)
 { 
     u32 eax, ebx, ecx, edx;
     u32 cr4;
     u32 feature_control;
     int ret;
+
+    asm volatile(
+        "mov $0x0, %%ecx\n\t"
+        "mov $0x7, %%eax\n\t"
+        "cpuid\n\t"
+        : "=c" (ecx)
+        :
+        : "eax", "ebx"
+    );
+    tdx_dprintf(1, "CPUID.07H:ECX = 0x%08X\n", ecx);
 
     /* Intel SDM Vol 2D. 7.3 */
     cpuid(1, &eax, &ebx, &ecx, &edx);
@@ -363,9 +468,39 @@ static int enter_npseamldr(void *npseamldr, u32 npseamldr_size)
 
     tdx_dprintf(1, "execute GETSEC[ENTERACCS]\n");
 
-    enter_longmode();
-    ret = (int) enteraccs(npseamldr, npseamldr_size);
-    exit_longmode();
-
+    ret = enteraccs(npseamldr, npseamldr_size);
     return ret;
+}
+
+
+static u64 dump_seamldr_info()
+{
+    void *buf = memalign_tmphigh(0x100, 0x100);
+
+    u64 ret = seamcall(SEAMLDR_INFO, (u32) buf);
+    if (ret) {
+        return ret;
+    }
+
+    seamldr_info_t *seamldr_info = buf;
+    tdx_dprintf(1, \
+"""seamldr_info:\n\
+\tVersion: %d\n\
+\tVendorID: %08X\n\
+\tBuildDate: %08d\n\
+\tBuildNum: %04X\n\
+\tMinor: %03X\n\
+\tMajor: %08X\n\
+\n\
+\tseamextend.valid: %d\n\
+\tseamextend.seam_ready: %d\n\
+\tseamextend.p_seamldr_ready: %d\n\
+""", seamldr_info->version, seamldr_info->vendor_id,
+     seamldr_info->build_date, seamldr_info->build_num,
+     seamldr_info->minor, seamldr_info->major,
+     (int) seamldr_info->seamextend.valid, seamldr_info->seamextend.seam_ready,
+     seamldr_info->seamextend.p_seamldr_ready);
+
+    free(buf);
+    return 0;
 }
