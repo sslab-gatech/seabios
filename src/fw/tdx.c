@@ -5,6 +5,7 @@
 #include "x86.h"
 #include "stacks.h"
 #include "paravirt.h"
+#include "string.h"
 #include "tdx.h"
 
 #define MSR_IA32_VMX_BASIC          0x480
@@ -18,12 +19,13 @@
 
 #define tdx_dprintf(lvl, fmt, args...) dprintf(lvl, "[OpenTDX] " fmt, ##args)
 
+static void *load_qemu_cfg_file(const char *file_name);
 static void *setup_seam_range(u32 size);
-static void *load_npseamldr(void);
 static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
 static int enter_npseamldr(void *npseamldr, u32 npseamldr_size);
 static u64 dump_seamldr_info();
+static void dump_seam_sigstruct(seam_sigstruct_t *sigstruct);
 static u64 install_tdx_module();
 
 u64 pml4[PTES_PER_TABLE] VARFSEG __aligned(4096);
@@ -56,6 +58,8 @@ static void *vmx_area;
 u32 TDXInstallLock __VISIBLE;
 u32 TDXInstallStack __VISIBLE;
 static u32 InstalledCPUs;
+
+static seam_sigstruct_t seam_sigstruct;
 
 static __attribute__((always_inline)) void __enter_longmode()
 {
@@ -250,10 +254,39 @@ static u64 seamcall(u32 leaf, u32 ecx)
     return seamcall_ret;
 }
 
+static void *load_qemu_cfg_file(const char *file_name)
+{
+    struct romfile_s *file;
+    void *dst;
+
+    file = romfile_find(file_name);
+    if (!file) {
+        tdx_dprintf(1, "failed to find 'opt/opentdx.npseamldr'\n");
+        return NULL;
+    }
+
+    dst = malloc_high(file->size);
+    if (!dst) {
+        tdx_dprintf(1, "failed to malloc for %s\n", file_name);
+        return NULL;
+    }
+
+    int ret = file->copy(file, dst, file->size);
+    if (ret < 0) {
+        tdx_dprintf(1, "failed to copy %s\n", file_name);
+        free(dst);
+        return NULL;
+    }
+
+    return dst;
+}
+
 void
 opentdx_setup(void)
 {
     npseamldr_t *npseamldr;
+    static seam_sigstruct_t *seam_sigstruct;
+    static void *tdx_module;
     u32 seam_range_size = 64 * 1024 * 1024;
     void *seam_range_base;
     u64 ret;
@@ -267,7 +300,7 @@ opentdx_setup(void)
 
     tdx_dprintf(1, "configured seam range [%p, %p)\n", seam_range_base, seam_range_base + seam_range_size);
 
-    npseamldr = (npseamldr_t *) load_npseamldr();
+    npseamldr = (npseamldr_t *) load_qemu_cfg_file(OPENTDX_NPSEAMLDR);
     if (!npseamldr) {
         return;
     }
@@ -304,7 +337,21 @@ opentdx_setup(void)
         return;
     }
 
+    seam_sigstruct = load_qemu_cfg_file(OPENTDX_SEAM_SIGSTRUCT);
+    if (!seam_sigstruct) {
+        return;
+    }
+    dump_seam_sigstruct(seam_sigstruct);
+
+    tdx_module = load_qemu_cfg_file(OPENTDX_TDX_MODULE);
+    if (!tdx_module) {
+        return;
+    }
+
     install_tdx_module();
+
+    free(seam_sigstruct);
+    free(tdx_module);
 
     free(vmx_area);
     return;
@@ -352,33 +399,6 @@ static void *setup_seam_range(u32 size)
     wrmsr(MSR_IA32_SEAMRR_PHYS_MASK, seamrr_mask.raw);
 
     return (void *) start;
-}
-
-static void *load_npseamldr(void)
-{
-    struct romfile_s *file;
-    void *dst;
-
-    file = romfile_find("opt/opentdx.npseamldr");
-    if (!file) {
-        tdx_dprintf(1, "failed to find 'opt/opentdx.npseamldr'\n");
-        return NULL;
-    }
-
-    dst = malloc_high(file->size);
-    if (!dst) {
-        tdx_dprintf(1, "failed to malloc(npsaemldr->size)\n");
-        return NULL;
-    }
-
-    int ret = file->copy(file, dst, file->size);
-    if (ret < 0) {
-        tdx_dprintf(1, "failed to copy npseamldr\n");
-        free(dst);
-        return NULL;
-    }
-
-    return dst;
 }
 
 static void dump_acm_header(npseamldr_t *npseamldr)
@@ -515,6 +535,80 @@ static u64 dump_seamldr_info()
 
     free(buf);
     return 0;
+}
+
+static void dump_seam_sigstruct(seam_sigstruct_t *sigstruct)
+{
+    int i;
+
+    tdx_dprintf(1, \
+"""Seam Sigstruct\n\
+\theader_type: 0x%08X\n\
+\theader_length: 0x%08X\n\
+\theader_version: 0x%08X\n\
+\tmodule_type: 0x%08X\n\
+\tdate: 0x%08X\n\
+\tsize: 0x%08X\n\
+\tkey_size: 0x%08X\n\
+\tmodulus_size: 0x%08X\n\
+\texponent_size: 0x%08X\n\
+\treserved0: 0x00 0x00 0x00 ... 0x00 0x00 0x00\n\
+\n\
+\tmodulus: 0x%02X 0x%02X 0x%02X ... 0x%02X 0x%02X 0x%02X\n\
+\texponent: 0x%08X\n\
+\tsignature: 0x%02X 0x%02X 0x%02X ... 0x%02X 0x%02X 0x%02X\n\
+\n\
+\tseamhash: 0x%02X 0x%02X 0x%02X ... 0x%02X 0x%02X 0x%02X\n\
+\tseamsvn: 0x%04X\n\
+\tattributes: 0x%016llX\n\
+\trip_offset: 0x%04X\n\
+\tnum_stack_pages: 0x%02X\n\
+\tnum_tls_pages: 0x%02X\n\
+\tnum_keyhole_pages: 0x%04X\n\
+\tnum_global_data_pages: 0x%04X\n\
+\tmax_tdmrs: 0x%04X\n\
+\tmax_rsvd_per_tdmr: 0x%04X\n\
+\tpamt_entry_size_4k: 0x%04X\n\
+\tpamt_entry_size_2m: 0x%04X\n\
+\tpamt_entry_size_1g: 0x%04X\n\
+\treserved1: 0x00 0x00 0x00 0x00 0x00 0x00\n\
+\tmodule_hv: 0x%04X\n\
+\tmin_update_hv: 0x%04X\n\
+\tno_downgrade: 0x%02X\n\
+\treserved2: 0x00\n\
+\tnum_handoff_pages: 0x%04X\n\
+\n\
+\tgdt_idt_offset: 0x%08X\n\
+\tfault_wrapper_offset: 0x%08X\n\
+\treserved3: 0x00 0x00 0x00 ... 0x00 0x00 0x00\n\
+\tcpuid_table_size: 0x%08X\n\
+""", sigstruct->header_type, sigstruct->header_length, 
+     sigstruct->header_version, sigstruct->module_type.raw, 
+     sigstruct->date, sigstruct->size, 
+     sigstruct->key_size, sigstruct->modulus_size,
+     sigstruct->exponent_size,
+     sigstruct->modulus[SIGSTRUCT_MODULUS_SIZE - 1], sigstruct->modulus[SIGSTRUCT_MODULUS_SIZE - 2], sigstruct->modulus[SIGSTRUCT_MODULUS_SIZE - 3],
+     sigstruct->modulus[2], sigstruct->modulus[1], sigstruct->modulus[0], 
+     sigstruct->exponent,
+     sigstruct->signature[SIGSTRUCT_SIGNATURE_SIZE - 1], sigstruct->signature[SIGSTRUCT_SIGNATURE_SIZE - 2], sigstruct->signature[SIGSTRUCT_SIGNATURE_SIZE - 3],
+     sigstruct->signature[2], sigstruct->signature[1], sigstruct->signature[0], 
+     sigstruct->seamhash[SIGSTRUCT_SEAMHASH_SIZE - 1], sigstruct->seamhash[SIGSTRUCT_SEAMHASH_SIZE - 2], sigstruct->seamhash[SIGSTRUCT_SEAMHASH_SIZE - 3],
+     sigstruct->seamhash[2], sigstruct->seamhash[1], sigstruct->seamhash[0], 
+     sigstruct->seamsvn.raw, sigstruct->attributes,
+     sigstruct->rip_offset, sigstruct->num_stack_pages,
+     sigstruct->num_tls_pages, sigstruct->num_keyhole_pages,
+     sigstruct->num_global_data_pages, sigstruct->max_tdmrs,
+     sigstruct->max_rsvd_per_tdmr, sigstruct->pamt_entry_size_4k,
+     sigstruct->pamt_entry_size_2m, sigstruct->pamt_entry_size_1g,
+     sigstruct->module_hv, sigstruct->min_update_hv,
+     sigstruct->no_downgrade, sigstruct->num_handoff_pages,
+     sigstruct->gdt_idt_offset, sigstruct->fault_wrapper_offset,
+     sigstruct->cpuid_table_size
+     );
+
+     for (i = 0; i < SEAM_SIGSTRUCT_MAX_CPUID_TABLE_SIZE; i++) {
+        dprintf(1, "\tcpuid_table[%d]: 0x%08X\n", i, sigstruct->cpuid_table[i]);
+     }
 }
 
 void VISIBLE32FLAT

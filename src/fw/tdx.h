@@ -47,6 +47,11 @@
 
 #define SEAM_SIGSTRUCT_MAX_CPUID_TABLE_SIZE 255
 
+/* QEMU CFG file names */
+#define OPENTDX_NPSEAMLDR           "opt/opentdx.npseamldr"
+#define OPENTDX_TDX_MODULE          "opt/opentdx.tdx_module"
+#define OPENTDX_SEAM_SIGSTRUCT      "opt/opentdx.seam_sigstruct"
+
 typedef union {
     struct {
         u32 reserved0   : 3;
@@ -167,7 +172,7 @@ typedef union
     u16 raw;
 } seam_svn_t;
 
-typedef struct {
+typedef struct __attribute__((__packed__)) {
     u32 header_type;
     u32 header_length;
     u32 header_version;
