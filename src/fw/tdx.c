@@ -12,6 +12,7 @@
 #define CPUID_ECX_SMX 6
 #define CR4_SMXE 14
 #define CR4_VMXE 13
+#define CR0_NE 5
 #define MSR_IA32_FEATURE_CONTROL 0x0000003a
 
 #define APIC_ICR_LOW ((u8*)BUILD_APIC_ADDR + 0x300)
@@ -19,11 +20,12 @@
 
 #define tdx_dprintf(lvl, fmt, args...) dprintf(lvl, "[OpenTDX] " fmt, ##args)
 
-static void *load_qemu_cfg_file(const char *file_name);
+static void *load_qemu_cfg_file(const char *file_name, int *size);
 static void *setup_seam_range(u32 size);
 static void dump_acm_header(npseamldr_t *npseamldr);
 static int check_acm_header(npseamldr_t *npseamldr);
 static int enter_npseamldr(void *npseamldr, u32 npseamldr_size);
+static void allocate_vmxareas();
 static u64 dump_seamldr_info();
 static void dump_seam_sigstruct(seam_sigstruct_t *sigstruct);
 static u64 install_tdx_module();
@@ -53,13 +55,16 @@ struct descloc_s_64 rombios64_gdt_80 VARFSEG = {
 static u64 enteraccs_stack;
 static u64 seamcall_ret;
 
-static void *vmx_area;
+static void *vmx_areas;
 
 u32 TDXInstallLock __VISIBLE;
 u32 TDXInstallStack __VISIBLE;
 static u32 InstalledCPUs;
 
-static seam_sigstruct_t seam_sigstruct;
+static seam_sigstruct_t *seam_sigstruct;
+static void *tdx_module;
+static int tdx_module_size;
+static seamldr_params_t seamldr_params __aligned(4096);
 
 static __attribute__((always_inline)) void __enter_longmode()
 {
@@ -75,7 +80,8 @@ static __attribute__((always_inline)) void __enter_longmode()
         "btsl $8, %%eax\n\t" // Enable long mode in EFER
         "wrmsr\n\t"
         "movl %%cr0, %%eax\n\t"
-        "btsl $31, %%eax\n\t" // Enable paging in CR0
+        "btsl $31, %%eax\n\t" // Set PG in CR0
+        "btsl $1, %%eax\n\t" // Set MP in CR0
         "movl %%eax, %%cr0\n\t"
         "lgdt (%%ebx)\n\t"
         "ljmpl $0x8, $1f\n\t"
@@ -99,6 +105,7 @@ static __attribute__((always_inline)) void __exit_longmode()
         "1:\n\t" // From here, we are in X86 mode
         "movl %%cr0, %%eax\n\t"
         "btrl $31, %%eax\n\t"
+        "btrl $1, %%eax\n\t"
         "movl %%eax, %%cr0\n\t" // Disable paging in CR0
         "movl %[efer], %%ecx\n\t"
         "rdmsr\n\t"
@@ -124,16 +131,32 @@ static __attribute__((always_inline)) void __exit_longmode()
 static __attribute__((always_inline)) void __vmxon()
 {
     asm volatile(
+        "pushl %%ebx\n\t" // push rbx
+        "pushl %%ecx\n\t" // push rcx
+        "pushl %%edx\n\t" // push rdx
+        "mov $0x1, %%eax\n\t"
+        "cpuid\n\t"
+        "mov %%ebx, %%eax\n\t"
+        "shr $24, %%eax\n\t" // Find the id of current CPU
+        "shl $12, %%eax\n\t" // Calculate vmx_area address using CPU id as index
+        "popl %%edx\n\t"
+        "popl %%ecx\n\t"
+        "popl %%ebx\n\t"
+        "movl (%%ebx), %%ebx\n\t"
+        "addl %%eax, %%ebx\n\t"
         "mov %%cr4, %%eax\n\t"
         "btsl %[cr4_vmxe], %%eax\n\t"
         "mov %%eax, %%cr4\n\t"
+        "mov %%cr0, %%eax\n\t"
+        "btsl %[cr0_ne], %%eax\n\t"
+        "mov %%eax, %%cr0\n\t"
         "rdmsr\n\t"
         "movl %%eax, (%%ebx)\n\t" // Save revision_id
         "pushl %%ebx\n\t"
         "vmxon (%%esp)\n\t"
         "popl %%ebx\n\t"
         :
-        : "b" (vmx_area), "c" (MSR_IA32_VMX_BASIC), [cr4_vmxe] "g" (CR4_VMXE)
+        : "b" (&vmx_areas), "c" (MSR_IA32_VMX_BASIC), [cr4_vmxe] "i" (CR4_VMXE), [cr0_ne] "i" (CR0_NE)
         : "eax", "memory"
     );
 }
@@ -246,7 +269,7 @@ static u64 seamcall(u32 leaf, u32 ecx)
     __enter_longmode();
     __vmxon();
 
-    __seamcall(0, ecx);
+    __seamcall(leaf, ecx);
 
     __vmxoff();
     __exit_longmode();
@@ -254,7 +277,7 @@ static u64 seamcall(u32 leaf, u32 ecx)
     return seamcall_ret;
 }
 
-static void *load_qemu_cfg_file(const char *file_name)
+static void *load_qemu_cfg_file(const char *file_name, int *size)
 {
     struct romfile_s *file;
     void *dst;
@@ -265,7 +288,7 @@ static void *load_qemu_cfg_file(const char *file_name)
         return NULL;
     }
 
-    dst = malloc_high(file->size);
+    dst = memalign_high(PAGE_SIZE, file->size);
     if (!dst) {
         tdx_dprintf(1, "failed to malloc for %s\n", file_name);
         return NULL;
@@ -278,15 +301,23 @@ static void *load_qemu_cfg_file(const char *file_name)
         return NULL;
     }
 
+    if (size)
+        *size = file->size;
+
     return dst;
+}
+
+static void allocate_vmxareas()
+{
+    int n_cpus = qemu_get_present_cpus_count();
+
+    vmx_areas = memalign_tmphigh(PAGE_SIZE, n_cpus * PAGE_SIZE);
 }
 
 void
 opentdx_setup(void)
 {
     npseamldr_t *npseamldr;
-    static seam_sigstruct_t *seam_sigstruct;
-    static void *tdx_module;
     u32 seam_range_size = 64 * 1024 * 1024;
     void *seam_range_base;
     u64 ret;
@@ -300,7 +331,7 @@ opentdx_setup(void)
 
     tdx_dprintf(1, "configured seam range [%p, %p)\n", seam_range_base, seam_range_base + seam_range_size);
 
-    npseamldr = (npseamldr_t *) load_qemu_cfg_file(OPENTDX_NPSEAMLDR);
+    npseamldr = (npseamldr_t *) load_qemu_cfg_file(OPENTDX_NPSEAMLDR, NULL);
     if (!npseamldr) {
         return;
     }
@@ -328,7 +359,7 @@ opentdx_setup(void)
     tdx_dprintf(1, "npseamldr exited with %d\n", (int) ret);
     free(npseamldr);
 
-    vmx_area = memalign_tmphigh(0x1000, 0x1000);
+    allocate_vmxareas();
 
     tdx_dprintf(1, "dump pseamldr info...\n");
     ret = dump_seamldr_info();
@@ -337,23 +368,28 @@ opentdx_setup(void)
         return;
     }
 
-    seam_sigstruct = load_qemu_cfg_file(OPENTDX_SEAM_SIGSTRUCT);
+    seam_sigstruct = load_qemu_cfg_file(OPENTDX_SEAM_SIGSTRUCT, NULL);
     if (!seam_sigstruct) {
+        free(vmx_areas);
         return;
     }
+
+    tdx_dprintf(1, "loaded seam_sigstruct at 0x%08x\n", seam_sigstruct);
     dump_seam_sigstruct(seam_sigstruct);
 
-    tdx_module = load_qemu_cfg_file(OPENTDX_TDX_MODULE);
+    tdx_module = load_qemu_cfg_file(OPENTDX_TDX_MODULE, &tdx_module_size);
     if (!tdx_module) {
+        free(vmx_areas);
+        free(seam_sigstruct);
         return;
     }
 
+    tdx_dprintf(1, "loaded tdx_module at 0x%08x, size: %d\n", tdx_module, tdx_module_size);
     install_tdx_module();
 
+    free(vmx_areas);
     free(seam_sigstruct);
     free(tdx_module);
-
-    free(vmx_area);
     return;
 }
 
@@ -606,7 +642,7 @@ static void dump_seam_sigstruct(seam_sigstruct_t *sigstruct)
      sigstruct->cpuid_table_size
      );
 
-     for (i = 0; i < SEAM_SIGSTRUCT_MAX_CPUID_TABLE_SIZE; i++) {
+     for (i = 0; i < sigstruct->cpuid_table_size; i++) {
         dprintf(1, "\tcpuid_table[%d]: 0x%08X\n", i, sigstruct->cpuid_table[i]);
      }
 }
@@ -618,7 +654,7 @@ handle_tdx_install(void)
     cpuid(1, &eax, &ebx, &ecx, &cpuid_features);
     tdx_dprintf(1, "CPU #%d: installing tdx module...\n", ebx >> 24);
 
-    // TDX module installation goes here
+    u64 ret = seamcall(SEAMLDR_INSTALL, (u32) &seamldr_params);
 
     InstalledCPUs++;
 }
@@ -626,11 +662,39 @@ handle_tdx_install(void)
 static u64 install_tdx_module()
 {
     u32 eax, ebx, ecx, cpuid_features;
+    int i;
+
     cpuid(1, &eax, &ebx, &ecx, &cpuid_features);
 
-    tdx_dprintf(1, "CPU #%d: installing tdx module...\n", ebx >> 24);
+    int tdx_module_pages = tdx_module_size / PAGE_SIZE + ((int) (tdx_module_size % PAGE_SIZE));
+    seamldr_params.version = 0;
+    seamldr_params.scenario = 0; // SCENARIO_LOAD
+    seamldr_params.sigstruct_pa = (u32) seam_sigstruct;
 
-    // TDX module installation goes here
+    seamldr_params.num_module_pages = tdx_module_pages;
+    for (i = 0; i < tdx_module_pages; i++) {
+        seamldr_params.mod_pages_pa_list[i] = (u32) tdx_module + (PAGE_SIZE * i);
+    }
+
+    tdx_dprintf(1, \
+"""seamldr_params:\n\
+\tversion: %d\n\
+\tscenario: %d\n\
+\tsigstruct_pa: 0x%0llx\n\
+\tnum_module_pages: %d\n\
+\tmod_pages_pa_list[0]: 0x%0llx\n\
+\t...\n\
+\tmod_pages_pa_list[%d]: 0x%0llx\n\
+""", seamldr_params.version, seamldr_params.scenario,
+     seamldr_params.sigstruct_pa, (int) seamldr_params.num_module_pages,
+     seamldr_params.mod_pages_pa_list[0],
+     tdx_module_pages - 1, seamldr_params.mod_pages_pa_list[tdx_module_pages - 1]);
+
+    tdx_dprintf(1, "CPU #%d: installing tdx module...\n", ebx >> 24);
+    u64 ret = seamcall(SEAMLDR_INSTALL, (u32) &seamldr_params);
+    if (ret) {
+        return ret;
+    }
 
     InstalledCPUs = 1;
     u16 nCPUs = qemu_get_present_cpus_count();
