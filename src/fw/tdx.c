@@ -243,6 +243,39 @@ static int enteraccs(void *npseamldr, u32 npseamldr_size)
     return ret;
 }
 
+static __attribute__((always_inline)) u32 __enable_mktme()
+{
+    u32 keyid_bits;
+
+    asm volatile(
+        "movl %[tme_capability], %%ecx\n\t"
+        "rdmsr\n\t"
+        "andl $0xf, %%edx\n\t"           // Get the number of mktme bits
+        "movl $0x80000002, %%eax\n\t"   // Hardware Encryption Enable (bit 1), TME Encryption Bypass Enable (bit 31)
+        "movl %%edx, %%ebx\n\t"
+        "orl $0x10, %%edx\n\t"          // Use MSB 1bit for TDX
+        "orl $0x10000, %%edx\n\t"       // AES-XTS 128
+        "movl %[tme_activate], %%ecx\n\t"
+        "wrmsr\n\t"
+        : "=b" (keyid_bits)
+        : [tme_capability] "g" (MSR_IA32_TME_CAPABILITY), [tme_activate] "g" (MSR_IA32_TME_ACTIVATE)
+        : "eax", "ecx", "edx"
+    );
+
+    return keyid_bits;
+}
+
+static int enable_mktme()
+{
+    int keyid_bits;
+
+    __enter_longmode();
+    keyid_bits = (int) __enable_mktme();
+    __exit_longmode();
+
+    return keyid_bits;
+}
+
 static __attribute__((always_inline)) void __seamcall(u32 ebx, u32 ecx)
 {
     asm volatile(
@@ -663,6 +696,9 @@ static u64 install_tdx_module()
 {
     u32 eax, ebx, ecx, cpuid_features;
     int i;
+
+    CPUKeyIDBits = enable_mktme();
+    tdx_dprintf(1, "number of keyid bits: %d\n", CPUKeyIDBits);
 
     cpuid(1, &eax, &ebx, &ecx, &cpuid_features);
 

@@ -27,6 +27,7 @@
 #include "x86.h" // cpuid
 #include "xen.h" // xen_biostable_setup
 #include "stacks.h" // yield
+#include "fw/tdx.h"
 
 // Amount of continuous ram under 4Gig
 u32 RamSize;
@@ -34,6 +35,8 @@ u32 RamSize;
 u64 RamSizeOver4G;
 // physical address space bits
 u8 CPUPhysBits;
+// keyid bits if MKTME is on
+u8 CPUKeyIDBits;
 // 64bit processor
 u8 CPULongMode;
 // Type of emulator platform.
@@ -184,6 +187,8 @@ static void physbits(int qemu_quirk)
 
     if (valid)
         CPUPhysBits = physbits;
+
+    CPUKeyIDBits = 0;
 }
 
 static void qemu_detect(void)
@@ -281,15 +286,16 @@ qemu_platform_setup(void)
 
     kvmclock_init();
 
-    // Initialize pci
-    pci_setup();
-    smm_device_setup();
-    smm_setup();
-
     // Initialize mtrr, msr_feature_control and smp
     mtrr_setup();
     msr_feature_control_setup();
     smp_setup();
+    opentdx_setup();
+
+    // Initialize pci
+    pci_setup();
+    smm_device_setup();
+    smm_setup();
 
     // Create bios tables
     if (MaxCountCPUs <= 255) {

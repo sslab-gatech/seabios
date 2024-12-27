@@ -1186,7 +1186,7 @@ pci_setup(void)
     dprintf(3, "pci setup\n");
 
     if (CPUPhysBits) {
-        pci_mem64_top = 1LL << CPUPhysBits;
+        pci_mem64_top = 1LL << (CPUPhysBits - CPUKeyIDBits);
         if (CPUPhysBits > 46) {
             // Old linux kernels have trouble dealing with more than 46
             // phys-bits, so avoid that for now.  Seems to be a bug in the

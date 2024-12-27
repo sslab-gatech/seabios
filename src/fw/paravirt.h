@@ -32,6 +32,7 @@ extern u32 RamSize;
 extern u64 RamSizeOver4G;
 extern int PlatformRunningOn;
 extern u8 CPUPhysBits;
+extern u8 CPUKeyIDBits;
 extern u8 CPULongMode;
 
 static inline int runningOnQEMU(void) {

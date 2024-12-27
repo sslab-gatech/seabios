@@ -25,6 +25,12 @@
 #define WAKEUP          8
 
 /*
+ * MKTME MSRs
+ */
+#define MSR_IA32_TME_CAPABILITY     0x981
+#define MSR_IA32_TME_ACTIVATE       0x982
+
+/*
  * TDX MSRs
  */
 #define MSR_IA32_SEAMRR_PHYS_BASE   0x1400
