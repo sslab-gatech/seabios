@@ -450,7 +450,7 @@ static void *setup_seam_range(u32 size)
         if (e->size < min_size)
             continue;
 
-        start = (e->start + (SEAMRR_BLOCK_SIZE - 1)) & ~(SEAMRR_BLOCK_SIZE - 1);
+        start = ((e->start + e->size - min_size) + (SEAMRR_BLOCK_SIZE -1)) & ~(SEAMRR_BLOCK_SIZE -1);
         break;
     }
 
