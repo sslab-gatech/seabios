@@ -75,10 +75,6 @@ COMMONCFLAGS += $(call cc-option,$(CC),-Wno-array-bounds,)
 COMMONCFLAGS += $(call cc-option,$(CC),-fcf-protection=none,)
 COMMA := ,
 
-ifdef SHRINK
-COMMONCFLAGS += -DSHRINK=1
-endif
-
 CFLAGS32FLAT := $(COMMONCFLAGS) -DMODE16=0 -DMODESEGMENT=0
 CFLAGSSEG := $(COMMONCFLAGS) -DMODESEGMENT=1 -fno-defer-pop \
     $(call cc-option,$(CC),-fno-jump-tables,-DMANUAL_NO_JUMP_TABLE) \

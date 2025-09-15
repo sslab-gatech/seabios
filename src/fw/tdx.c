@@ -250,11 +250,7 @@ static __attribute__((always_inline)) u32 __enable_mktme()
     asm volatile(
         "movl %[tme_capability], %%ecx\n\t"
         "rdmsr\n\t"
-#ifdef SHRINK
-        "movl $0x3, %%edx\n\t"
-#else
         "andl $0xf, %%edx\n\t"           // Get the number of mktme bits
-#endif
         "movl $0x80000002, %%eax\n\t"   // Hardware Encryption Enable (bit 1), TME Encryption Bypass Enable (bit 31)
         "movl %%edx, %%ebx\n\t"
         "orl $0x10, %%edx\n\t"          // Use MSB 1bit for TDX
