@@ -432,6 +432,7 @@ static void *setup_seam_range(u32 size)
     seamrr_mask_t seamrr_mask;
     u64 n, i, min_size;
     u64 start = 0;
+    u64 fixed;
 
     if (size % SEAMRR_BLOCK_SIZE) {
         tdx_dprintf(1, "seam_range_size is not aligned to 32MB\n");
@@ -443,7 +444,19 @@ static void *setup_seam_range(u32 size)
     n = size / SEAMRR_BLOCK_SIZE;
     min_size = (n + 1) * SEAMRR_BLOCK_SIZE;
 
+    /* Keep the SEAM range at 1 GiB, below the initrd relocation. */
+    fixed = 0x40000000;
     for (i = 0; i < e820_count; i++) {
+        struct e820entry *e = &e820_list[i];
+        if (e->type == E820_RESERVED)
+            continue;
+        if (fixed >= e->start && fixed + size <= e->start + e->size) {
+            start = fixed;
+            break;
+        }
+    }
+
+    for (i = 0; !start && i < e820_count; i++) {
         struct e820entry *e = &e820_list[i];
         if (e->type == E820_RESERVED)
             continue;
@@ -460,6 +473,11 @@ static void *setup_seam_range(u32 size)
     }
 
     e820_add(start, size, E820_RESERVED);
+
+    /* Keep the legacy memory top below the range so the boot ROM
+     * relocates the initrd instead of placing it inside the range. */
+    if (start == fixed && LegacyRamSize > start)
+        LegacyRamSize = start;
 
     seamrr_base.raw = start | (1 << SEAMRR_CONFIGURE_OFFSET);
     seamrr_mask.raw = size | (1 << SEAMRR_ENABLE_OFFSET);
